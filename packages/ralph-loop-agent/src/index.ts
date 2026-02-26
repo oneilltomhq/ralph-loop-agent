@@ -12,6 +12,7 @@ export {
   inputTokenCountIs,
   outputTokenCountIs,
   costIs,
+  durationIs,
   getModelPricing,
   calculateCost,
   addLanguageModelUsage,

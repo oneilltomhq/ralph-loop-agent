@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { MockLanguageModelV3, convertArrayToReadableStream } from 'ai/test';
-import { RalphLoopAgent, iterationCountIs } from './ralph-loop-agent';
+import { RalphLoopAgent, iterationCountIs, durationIs } from './ralph-loop-agent';
 
 // Helper to create mock usage object with all required fields
 const createMockUsage = () => ({
@@ -287,11 +287,11 @@ describe('RalphLoopAgent', () => {
       const condition = iterationCountIs(5);
       
       // Should not stop before reaching count
-      expect(condition({ iteration: 4, allResults: [], totalUsage: {} as any, model: 'test' })).toBe(false);
+      expect(condition({ iteration: 4, allResults: [], totalUsage: {} as any, model: 'test', elapsedMs: 1000 })).toBe(false);
       // Should stop at count
-      expect(condition({ iteration: 5, allResults: [], totalUsage: {} as any, model: 'test' })).toBe(true);
+      expect(condition({ iteration: 5, allResults: [], totalUsage: {} as any, model: 'test', elapsedMs: 1000 })).toBe(true);
       // Should stop after count
-      expect(condition({ iteration: 6, allResults: [], totalUsage: {} as any, model: 'test' })).toBe(true);
+      expect(condition({ iteration: 6, allResults: [], totalUsage: {} as any, model: 'test', elapsedMs: 1000 })).toBe(true);
     });
 
     it('should control max iterations in agent', async () => {
@@ -312,6 +312,55 @@ describe('RalphLoopAgent', () => {
 
       const result = await agent.loop({ prompt: 'Test' });
       expect(result.iterations).toBe(7);
+    });
+  });
+
+  describe('durationIs', () => {
+    it('should create a stop condition function', () => {
+      const condition = durationIs(5000);
+      expect(typeof condition).toBe('function');
+    });
+
+    it('should stop when elapsed time reaches the specified duration', () => {
+      const condition = durationIs(5000);
+      
+      // Should not stop before duration
+      expect(condition({ iteration: 1, allResults: [], totalUsage: {} as any, model: 'test', elapsedMs: 4000 })).toBe(false);
+      // Should stop at duration
+      expect(condition({ iteration: 1, allResults: [], totalUsage: {} as any, model: 'test', elapsedMs: 5000 })).toBe(true);
+      // Should stop after duration
+      expect(condition({ iteration: 1, allResults: [], totalUsage: {} as any, model: 'test', elapsedMs: 6000 })).toBe(true);
+    });
+
+    it('should stop a running agent after the specified duration', async () => {
+      let callCount = 0;
+      const mockModel = new MockLanguageModelV3({
+        doGenerate: async () => {
+          callCount++;
+          // Simulate some delay
+          await new Promise(resolve => setTimeout(resolve, 100));
+          return {
+            content: [{ type: 'text', text: 'Response' }],
+            finishReason: { unified: 'stop', raw: 'stop' },
+            usage: createMockUsage(),
+            warnings: [],
+          };
+        },
+      });
+
+      // 500ms duration limit
+      const agent = new RalphLoopAgent({
+        model: mockModel,
+        stopWhen: durationIs(500),
+        verifyCompletion: () => ({ complete: false }),
+      });
+
+      const result = await agent.loop({ prompt: 'Test' });
+      
+      // Should have stopped due to duration (roughly 5 iterations at 100ms each)
+      expect(result.iterations).toBeGreaterThan(1);
+      expect(result.iterations).toBeLessThan(10);
+      expect(result.completionReason).toBe('max-iterations');
     });
   });
 

@@ -92,7 +92,7 @@ export interface RalphLoopAgentResult<TOOLS extends ToolSet = {}> {
 }
 
 // Re-export stop condition helpers
-export { iterationCountIs } from './ralph-stop-condition';
+export { iterationCountIs, durationIs } from './ralph-stop-condition';
 export type { RalphStopCondition, RalphStopConditionContext } from './ralph-stop-condition';
 
 /**
@@ -233,6 +233,7 @@ export class RalphLoopAgent<TOOLS extends ToolSet = {}> {
     const stopConditions = this.getStopConditions();
     const modelId = this.getModelId();
     const model = this.settings.model;
+    const loopStartTime = Date.now();
 
     // Reset context manager for new loop (unless preserving context for resume)
     if (!preserveContext) {
@@ -431,6 +432,7 @@ export class RalphLoopAgent<TOOLS extends ToolSet = {}> {
         allResults,
         totalUsage,
         model: modelId,
+        elapsedMs: Date.now() - loopStartTime,
       };
 
       if (await isRalphStopConditionMet({ stopConditions, context: stopContext })) {
@@ -503,6 +505,7 @@ export class RalphLoopAgent<TOOLS extends ToolSet = {}> {
 
     const stopConditions = this.getStopConditions();
     const modelId = this.getModelId();
+    const loopStartTime = Date.now();
 
     const initialUserMessage: ModelMessage = {
       role: 'user',
@@ -525,6 +528,7 @@ export class RalphLoopAgent<TOOLS extends ToolSet = {}> {
         allResults,
         totalUsage,
         model: modelId,
+        elapsedMs: Date.now() - loopStartTime,
       };
 
       // If next iteration would stop, stream this one instead

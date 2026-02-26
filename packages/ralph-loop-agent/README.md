@@ -180,11 +180,15 @@ import {
   tokenCountIs, 
   inputTokenCountIs,
   outputTokenCountIs,
-  costIs 
+  costIs,
+  durationIs
 } from 'ralph-loop-agent';
 
 // Stop after N iterations
 stopWhen: iterationCountIs(20)
+
+// Stop after N milliseconds (wall-clock time)
+stopWhen: durationIs(25 * 60_000)  // 25 minutes (one pomodoro)
 
 // Stop after N total tokens
 stopWhen: tokenCountIs(100_000)

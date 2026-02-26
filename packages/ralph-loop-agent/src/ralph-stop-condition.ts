@@ -24,6 +24,11 @@ export type RalphStopConditionContext<TOOLS extends ToolSet = {}> = {
    * The model identifier (e.g., 'anthropic/claude-opus-4.5').
    */
   model: string;
+
+  /**
+   * Wall-clock time elapsed since the loop started, in milliseconds.
+   */
+  elapsedMs: number;
 };
 
 /**
@@ -370,6 +375,19 @@ export function costIs(
     const currentCost = calculateCost(totalUsage, rates);
     return currentCost >= maxCostDollars;
   };
+}
+
+/**
+ * Stop when wall-clock duration reaches the specified number of milliseconds.
+ *
+ * @example
+ * ```ts
+ * // Stop after 25 minutes (one pomodoro)
+ * stopWhen: durationIs(25 * 60_000)
+ * ```
+ */
+export function durationIs(maxMs: number): RalphStopCondition<any> {
+  return ({ elapsedMs }) => elapsedMs >= maxMs;
 }
 
 /**
