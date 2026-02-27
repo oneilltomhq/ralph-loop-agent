@@ -1,63 +1,70 @@
-# Pomodoro Runner - Layer 1 Results
+# Pomodoro Runner
 
-## Setup
+Autonomous coding agent with a time budget. Uses the `.pomodoro/` convention for task management.
 
-Location: `examples/pomodoro/`
+## Quick Start
 
-Stop policy: `[durationIs(25min), costIs($50), iterationCountIs(50)]`
+```bash
+cd examples/pomodoro
+pnpm install
 
-## Key Fix: verifyCompletion
+# Point at any project — it will bootstrap .pomodoro/backlog.md if needed
+GOOGLE_GENERATIVE_AI_API_KEY=... npx tsx index.ts /path/to/your/repo
 
-The critical fix was in `verifyCompletion` - it was returning `complete: true` when `markComplete` was called, causing early exit. Fixed to always return `complete: false` so duration/cost/iteration limits control when to stop.
+# Shorter session
+GOOGLE_GENERATIVE_AI_API_KEY=... npx tsx index.ts /path/to/repo --duration 10
 
-## Test Runs
+# Different model
+OPENROUTER_API_KEY=... npx tsx index.ts /path/to/repo --model minimax/minimax-m2.5
+```
 
-### Run 1: Initial test (gemini-2.5-pro)
-- **Duration**: 1.54 min
-- **Iterations**: 1
-- **Tasks**: M0 tests (redo of existing work)
-- **Issue**: Exited early due to verifyCompletion returning complete: true
+## How It Works
 
-### Run 2: After fix attempt (gemini-2.5-pro)
-- **Duration**: 3.38 min
-- **Iterations**: 2
-- **Tasks**: Click, scroll, hover, select commands + architecture for persistent agent
-- **Note**: Still exiting early
+1. Agent checks for `.pomodoro/backlog.md` in the working directory
+2. If missing, bootstraps one from TODO.md, ROADMAP.md, README.md, code TODOs
+3. Picks the top unchecked task from the **Active** section
+4. Works on it: reads code, makes changes, verifies
+5. Updates the backlog (checks off done, adds discovered tasks)
+6. Picks the next task. Repeats until time/cost/iteration limit.
+7. Writes a session report to `.pomodoro/sessions/`
 
-### Run 3: After increasing limits
-- **Duration**: 4.26 min
-- **Iterations**: 2
-- **Tasks**: Completed all M1 tasks (type, screenshot, evaluate commands), created M2 placeholder
-- **Issue**: verifyCompletion still causing early exit
+See [CONVENTION.md](CONVENTION.md) for the full `.pomodoro/` spec.
 
-### Run 4: After verifyCompletion fix (gemini-2.5-pro)
-- **Duration**: ~15+ min (process still running when checked)
-- **Iterations**: Multiple
-- **Tasks**: 
-  - Completed all M1 (browser control)
-  - Completed M2 (agent loop)
-  - Started M3 (Integration & Polish)
-- **Output**: "→ Task complete, continuing to next task..." - fix working!
+## Options
 
-### Run 5: Final run results
-- **Changes**: LAB.md, ROADMAP.md, TODO.md, src/commands.ts, src/fs.ts, src/program.ts, src/renderer.ts, src/shell.ts, src/sidepanel.ts, vite.config.ts
-- **M1**: All browser commands complete
-- **M2**: Agent command implemented
-- **M3**: Started
+| Flag | Default | Description |
+|------|---------|-------------|
+| `[working-dir]` | `.` | Project directory to work in |
+| `--duration N` | `25` | Session length in minutes |
+| `--model NAME` | auto | Model name or alias (`gemini`, `minimax`) |
+| `--max-cost N` | `50` | Dollar budget |
+| `--max-iterations N` | `50` | Max loop iterations |
 
-## Observations
+## Earlier Test Results (pre-convention)
 
-1. **verifyCompletion was the key issue** - returning complete: true on markComplete caused early exit
-2. **durationIs works correctly** - when verifyCompletion doesn't exit, agent runs until duration limit
-3. **Model choice**: Google AI (gemini-2.5-pro) works; OpenRouter/minimax has SDK compatibility issues
+Before the `.pomodoro/` convention, the runner used a hardcoded prompt
+that referenced project-specific files (TODO.md, ROADMAP.md, LAB.md).
 
-## OpenRouter/minimax Issue
+### Key Finding: `verifyCompletion`
 
-@ai-sdk/openai 1.x, 2.x, 3.x all use OpenAI's new "Responses API" which OpenRouter doesn't support. They all try to hit `/responses` endpoint instead of `/chat/completions`. Need a different approach for minimax.
+The critical fix was making `verifyCompletion` always return `false` so
+that `durationIs()` / `costIs()` / `iterationCountIs()` control when
+the loop exits — not the agent calling `markComplete`.
 
-## Next Steps
+### Test Runs (crush repo, gemini-2.5-pro)
 
-- [x] Fix verifyCompletion to not exit on markComplete
-- [x] Run full 25-min pomodoro session
-- [ ] Commit changes to crush repo
-- [ ] Test with minimax (need different SDK approach)
+| Run | Duration | Iterations | Result |
+|-----|----------|------------|--------|
+| 1 | 1.5 min | 1 | M0 tests |
+| 2 | 3.4 min | 2 | M1 browser commands |
+| 3 | 2.8 min | 2 | More M1 |
+| 4 | 4.3 min | 2 | M1 complete (still exiting early) |
+| 5* | ~15 min | Many | M1 + M2 + started M3 |
+
+\* After the `verifyCompletion` fix.
+
+### OpenRouter / minimax Issue
+
+`@ai-sdk/openai` v2+ uses OpenAI's Responses API (`/responses` endpoint)
+which OpenRouter doesn't support. Use `compatibility: 'strict'` to force
+chat completions format. This may still have issues depending on SDK version.

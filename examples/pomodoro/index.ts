@@ -1,17 +1,19 @@
 #!/usr/bin/env npx tsx
 /**
- * Pomodoro Runner - Minimal single-agent with time budget
+ * Pomodoro Runner — autonomous agent with a time budget
  *
- * Proves: one agent + durationIs() + coding tools = useful work in 25min
+ * Uses the .pomodoro/ convention for task management.
+ * See CONVENTION.md for the full spec.
  *
  * Usage:
- *   npx tsx index.ts "Your task here" [working-dir]
- *   npx tsx index.ts ./task.md [working-dir]
+ *   npx tsx index.ts [working-dir] [--duration 25] [--model gemini-2.5-pro]
+ *   npx tsx index.ts /path/to/repo
+ *   npx tsx index.ts /path/to/repo --duration 10
  *
  * Environment:
- *   GEMINI_API_KEY - Google Gemini API key (recommended - fast & cheap)
- *   OPENAI_API_KEY - Or use OpenAI
- *   ANTHROPIC_API_KEY - Or use Anthropic
+ *   GOOGLE_GENERATIVE_AI_API_KEY — Google Gemini (default)
+ *   OPENROUTER_API_KEY — OpenRouter (minimax, etc.)
+ *   OPENAI_API_KEY — OpenAI
  */
 
 import { RalphLoopAgent, durationIs, costIs, iterationCountIs } from 'ralph-loop-agent';
@@ -19,40 +21,57 @@ import { google } from '@ai-sdk/google';
 import { tool } from 'ai';
 import { z } from 'zod';
 import * as fs from 'fs/promises';
+import * as path from 'path';
 import * as childProcess from 'child_process';
 import { promisify } from 'util';
 
 const execAsync = promisify(childProcess.exec);
 
-// Parse CLI args
-const taskArg = process.argv[2];
-const workDir = process.argv[3] ? process.argv[3].replace('~', process.env.HOME || '') : process.cwd();
+// ---------------------------------------------------------------------------
+// CLI args
+// ---------------------------------------------------------------------------
 
-if (!taskArg) {
-  console.error('Usage: npx tsx index.ts <task or task-file> [working-directory]');
-  console.error('');
-  console.error('Examples:');
-  console.error('  npx tsx index.ts "Add a hello world function to hello.ts"');
-  console.error('  npx tsx index.ts ./task.md');
-  console.error('  npx tsx index.ts "Read TODO.md and complete tasks" /path/to/repo');
-  process.exit(1);
+function parseArgs() {
+  const args = process.argv.slice(2);
+  let workDir = process.cwd();
+  let durationMin = 25;
+  let modelOverride: string | undefined;
+  let maxCost = 50;
+  let maxIterations = 50;
+
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--duration' && args[i + 1]) {
+      durationMin = parseInt(args[++i], 10);
+    } else if (args[i] === '--model' && args[i + 1]) {
+      modelOverride = args[++i];
+    } else if (args[i] === '--max-cost' && args[i + 1]) {
+      maxCost = parseFloat(args[++i]);
+    } else if (args[i] === '--max-iterations' && args[i + 1]) {
+      maxIterations = parseInt(args[++i], 10);
+    } else if (!args[i].startsWith('--')) {
+      workDir = args[i].replace('~', process.env.HOME || '');
+    }
+  }
+
+  return { workDir, durationMin, modelOverride, maxCost, maxIterations };
 }
 
-// Change to working directory
+const { workDir, durationMin, modelOverride, maxCost, maxIterations } = parseArgs();
+
 process.chdir(workDir);
 console.log(`Working directory: ${workDir}`);
 
-// Read task from file or use as-is
-let task: string;
-try {
-  await fs.access(taskArg);
-  task = await fs.readFile(taskArg, 'utf-8');
-  console.log(`Task loaded from: ${taskArg}`);
-} catch {
-  task = taskArg;
-}
+// ---------------------------------------------------------------------------
+// Session metadata
+// ---------------------------------------------------------------------------
 
-// Minimal coding tools (local filesystem, no sandbox)
+const sessionId = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 16);
+const sessionReportPath = `.pomodoro/sessions/${sessionId}.md`;
+
+// ---------------------------------------------------------------------------
+// Tools
+// ---------------------------------------------------------------------------
+
 const tools = {
   readFile: tool({
     description: 'Read a file from the filesystem',
@@ -75,13 +94,11 @@ const tools = {
       path: z.string().describe('File path to write'),
       content: z.string().describe('Content to write'),
     }),
-    execute: async ({ path, content }) => {
+    execute: async ({ path: filePath, content }) => {
       try {
-        const pathModule = await import('path');
-        const dir = pathModule.dirname(path);
-        await fs.mkdir(dir, { recursive: true });
-        await fs.writeFile(path, content, 'utf-8');
-        return { success: true, path };
+        await fs.mkdir(path.dirname(filePath), { recursive: true });
+        await fs.writeFile(filePath, content, 'utf-8');
+        return { success: true, path: filePath };
       } catch (error: any) {
         return { success: false, error: error.message };
       }
@@ -89,13 +106,16 @@ const tools = {
   }),
 
   runCommand: tool({
-    description: 'Run a shell command',
+    description: 'Run a shell command and return stdout/stderr',
     parameters: z.object({
       command: z.string().describe('Shell command to run'),
     }),
     execute: async ({ command }) => {
       try {
-        const { stdout, stderr } = await execAsync(command, { maxBuffer: 10 * 1024 * 1024 });
+        const { stdout, stderr } = await execAsync(command, {
+          maxBuffer: 10 * 1024 * 1024,
+          timeout: 60_000,
+        });
         return { success: true, output: stdout || stderr };
       } catch (error: any) {
         return { success: false, error: error.message, output: error.stdout || error.stderr };
@@ -104,15 +124,15 @@ const tools = {
   }),
 
   listFiles: tool({
-    description: 'List files matching a pattern',
+    description: 'List files in the project (excludes node_modules, .git, dist)',
     parameters: z.object({
-      pattern: z.string().optional().describe('Glob pattern (default: all files)'),
+      pattern: z.string().optional().describe('Filter pattern (substring match)'),
     }),
     execute: async ({ pattern }) => {
       try {
-        const cmd = pattern 
-          ? `find . -type f -path "*${pattern}*" | grep -v node_modules | grep -v .git | head -50`
-          : `find . -type f | grep -v node_modules | grep -v .git | head -50`;
+        const cmd = pattern
+          ? `find . -type f -path "*${pattern}*" | grep -v node_modules | grep -v .git | grep -v dist | head -80`
+          : `find . -type f | grep -v node_modules | grep -v .git | grep -v dist | head -80`;
         const { stdout } = await execAsync(cmd);
         return { success: true, files: stdout.trim().split('\n').filter(Boolean) };
       } catch (error: any) {
@@ -120,130 +140,226 @@ const tools = {
       }
     },
   }),
-
-  markComplete: tool({
-    description: 'Mark the task as complete with a summary',
-    parameters: z.object({
-      summary: z.string().describe('Summary of what was accomplished'),
-    }),
-    execute: async ({ summary }) => {
-      return { complete: true, summary };
-    },
-  }),
 };
 
-// Configure agent with pomodoro-style stop policy
-const POMODORO_MS = 25 * 60 * 1000; // 25 minutes
-const MAX_COST = 50.00; // $50 budget (generous for testing)
-const MAX_ITERATIONS = 50; // Allow many iterations to hit duration limit
+// ---------------------------------------------------------------------------
+// System prompt — the .pomodoro/ convention, generic
+// ---------------------------------------------------------------------------
 
-// Model selection - prefer minimax via OpenRouter (cheapest)
-let model: any;
-if (process.env.OPENROUTER_API_KEY) {
-  const { createOpenAI } = await import('@ai-sdk/openai');
-  const openrouter = createOpenAI({
-    apiKey: process.env.OPENROUTER_API_KEY,
-    baseURL: 'https://openrouter.ai/api/v1',
-    compatibility: 'strict', // Force chat completions format
-  });
-  model = openrouter('minimax/minimax-m2.5');
-  console.log('Model: minimax-m2.5 (via OpenRouter)');
-} else if (process.env.GOOGLE_GENERATIVE_AI_API_KEY || process.env.GEMINI_API_KEY) {
-  model = google('gemini-2.5-pro');
-  console.log('Model: gemini-2.5-pro (via Google AI)');
-} else if (process.env.OPENAI_API_KEY) {
-  const { createOpenAI } = await import('@ai-sdk/openai');
-  const openai = createOpenAI({ apiKey: process.env.OPENAI_API_KEY });
-  model = openai('gpt-4o-mini');
-  console.log('Model: gpt-4o-mini (via OpenAI)');
-} else {
-  console.error('Error: Set OPENROUTER_API_KEY, GOOGLE_GENERATIVE_AI_API_KEY, or OPENAI_API_KEY');
+const SYSTEM_PROMPT = `You are a focused coding agent running a timed pomodoro session.
+You will be stopped automatically when time runs out. Work until then.
+
+## How You Work
+
+This project may use a \`.pomodoro/\` convention for task management.
+
+### If \`.pomodoro/backlog.md\` exists:
+
+1. Read it. The top unchecked item in the **Active** section is your current task.
+2. Work on that ONE task — read relevant code, make changes, verify.
+3. When done, update the backlog: check it off, move it to **Done**, note what you did.
+4. Pick the next unchecked item. Repeat.
+5. If you find new work or blockers, add them to the appropriate section.
+
+### If \`.pomodoro/backlog.md\` does NOT exist:
+
+Bootstrap it:
+1. Look for existing task sources: TODO.md, ROADMAP.md, README.md, CHANGELOG.md
+2. Scan for code TODOs: \`grep -rn 'TODO\\|FIXME\\|HACK' --include='*.ts' --include='*.js' --include='*.py' --include='*.go' . | head -30\`
+3. Examine the project structure to understand what it does
+4. Create \`.pomodoro/backlog.md\` with tasks organised into **Active**, **Blocked**, and **Done** sections
+5. Then start working through the Active items
+
+### Backlog format:
+
+\`\`\`markdown
+# Backlog
+
+## Active
+
+- [ ] Task title
+  > Context, notes, acceptance criteria
+
+## Blocked
+
+- [ ] Task title
+  > Blocked: reason
+
+## Done
+
+- [x] Task title
+  > Done: YYYY-MM-DD · what was done
+\`\`\`
+
+## Working On Each Task
+
+- Focus on ONE task at a time
+- Read the relevant code before changing it
+- Make incremental changes and verify they work (run tests, build, etc.)
+- If a task is too large, break it into subtasks in the backlog first
+- If a task is blocked, move it to **Blocked** with a reason, then pick the next one
+
+## Session Report
+
+When you sense time is almost up (you've done many iterations), write a session report to:
+\`${sessionReportPath}\`
+
+Format:
+\`\`\`markdown
+# Session ${sessionId}
+
+Model: [model name]
+Duration: [time]
+Iterations: [count]
+
+## Completed
+
+- [x] Task title
+  > What was done. Files changed.
+
+## Attempted
+
+- [ ] Task title
+  > How far you got. What's left.
+
+## Discovered
+
+- [ ] Any new tasks found during work
+
+## Blockers Found
+
+- Description of anything that blocked progress
+
+## Files Changed
+
+- list of files
+\`\`\`
+
+## Rules
+
+- Do NOT stop early. Work until the time limit forces you to stop.
+- Do NOT ask for user input. You are autonomous.
+- Do NOT rush through tasks to tick boxes. Quality > quantity.
+- DO verify your changes work before marking a task done.
+- DO update .pomodoro/backlog.md as you go — it is the source of truth.
+`;
+
+// ---------------------------------------------------------------------------
+// Model selection
+// ---------------------------------------------------------------------------
+
+async function selectModel(override?: string): Promise<{ model: any; name: string }> {
+  if (override === 'minimax' || (!override && process.env.OPENROUTER_API_KEY)) {
+    const { createOpenAI } = await import('@ai-sdk/openai');
+    const openrouter = createOpenAI({
+      apiKey: process.env.OPENROUTER_API_KEY,
+      baseURL: 'https://openrouter.ai/api/v1',
+      compatibility: 'strict',
+    });
+    const name = override || 'minimax/minimax-m2.5';
+    return { model: openrouter(name), name };
+  }
+
+  if (override === 'gemini' || (!override && (process.env.GOOGLE_GENERATIVE_AI_API_KEY || process.env.GEMINI_API_KEY))) {
+    const name = 'gemini-2.5-pro';
+    return { model: google(name), name };
+  }
+
+  if (process.env.OPENAI_API_KEY) {
+    const { createOpenAI } = await import('@ai-sdk/openai');
+    const openai = createOpenAI({ apiKey: process.env.OPENAI_API_KEY });
+    const name = override || 'gpt-4o-mini';
+    return { model: openai(name), name };
+  }
+
+  console.error('Error: Set GOOGLE_GENERATIVE_AI_API_KEY, OPENROUTER_API_KEY, or OPENAI_API_KEY');
   process.exit(1);
 }
 
+const { model, name: modelName } = await selectModel(modelOverride);
+console.log(`Model: ${modelName}`);
+
+// ---------------------------------------------------------------------------
+// Agent
+// ---------------------------------------------------------------------------
+
+const POMODORO_MS = durationMin * 60 * 1000;
+
 const agent = new RalphLoopAgent({
   model,
-  instructions: `You are a coding agent with a 25-minute time budget. Your goal is to maximize useful work done in that time.
-
-## CRITICAL: Run For Full 25 Minutes
-
-- You have a HARD STOP at 25 minutes — work until the duration limit is hit
-- Do NOT call markComplete until the very end when time is running out
-- Complete as many tasks as possible in sequence
-- When you finish a task, immediately pick the next one and keep working
-
-## Workflow (REPEAT until time runs out)
-
-1. **Read the backlog** — Look for TODO.md, ROADMAP.md
-2. **Pick ONE task** — Lowest-numbered incomplete item
-3. **Complete it** — Make changes, verify they work
-4. **Update roadmap** — Mark item complete, add findings
-5. **PICK NEXT TASK IMMEDIATELY** — Don't stop, keep going!
-6. **If roadmap is done** — Check README.md, LAB.md for new work
-7. **Create new items** — Add to ROADMAP.md and complete them
-8. **Only call markComplete** — When you sense time is almost up (many iterations done)
-
-## What To Do If You Run Out Of Roadmap
-
-- Read README.md and LAB.md for project direction
-- Look at the codebase for obvious improvements
-- Create new ROADMAP items for features, tests, docs, refactoring
-- Keep working until the duration limit forces you to stop
-
-## DO NOT
-
-- Do NOT call markComplete after each task — save it for the end
-- Do NOT stop early because you completed a few tasks
-- Do NOT wait for user input — work autonomously
-
-Be productive. Keep working. The experiment depends on you running for ~25 minutes.`,
+  instructions: SYSTEM_PROMPT,
   tools,
   stopWhen: [
     durationIs(POMODORO_MS),
-    costIs(MAX_COST, { inputCostPerMillionTokens: 0.2, outputCostPerMillionTokens: 0.2 }), // minimax pricing
-    iterationCountIs(MAX_ITERATIONS),
+    costIs(maxCost, { inputCostPerMillionTokens: 0.2, outputCostPerMillionTokens: 0.2 }),
+    iterationCountIs(maxIterations),
   ],
   verifyCompletion: async ({ result }) => {
-    // Don't exit just because markComplete was called - let the stop conditions handle that
-    // This allows the agent to keep working through multiple tasks
-    let hasMarkedComplete = false;
+    // Never exit early — let stop conditions (duration/cost/iterations) control termination.
+    // Log when the agent thinks it's done so we can see it in the console.
     for (const step of result.steps) {
       for (const toolResult of step.toolResults) {
-        if (toolResult.toolName === 'markComplete') {
-          hasMarkedComplete = true;
-          // Don't return complete: true here - let duration/cost/iteration limits control when to stop
+        if (toolResult.toolName === 'writeFile') {
+          const output = toolResult.output as any;
+          if (output?.path?.includes('.pomodoro/sessions/')) {
+            console.log('  → Session report written');
+          }
         }
       }
     }
-    if (hasMarkedComplete) {
-      console.log('  → Task complete, continuing to next task...');
-    }
-    return { 
-      complete: false, 
-      reason: 'Continue working. More tasks available.' 
+    return {
+      complete: false,
+      reason: 'Continue working. Pick the next task from the backlog.',
     };
   },
 });
 
-// Run the agent
+// ---------------------------------------------------------------------------
+// Run
+// ---------------------------------------------------------------------------
+
 console.log('\n╭───────────────────────────────────────────────────────────────╮');
 console.log('│  POMODORO RUNNER                                              │');
 console.log('╰───────────────────────────────────────────────────────────────╯');
-console.log(`\nTask: ${task.slice(0, 200)}${task.length > 200 ? '...' : ''}`);
-console.log(`\nStop policy: duration=${POMODORO_MS/60000}min, cost=$${MAX_COST}, iterations=${MAX_ITERATIONS}`);
+console.log(`\nSession:    ${sessionId}`);
+console.log(`Model:      ${modelName}`);
+console.log(`Duration:   ${durationMin} min`);
+console.log(`Max cost:   $${maxCost}`);
+console.log(`Iterations: ${maxIterations} max`);
+console.log(`Report:     ${sessionReportPath}`);
 console.log('\nStarting...\n');
 
 const startTime = Date.now();
-const result = await agent.loop({ prompt: task });
+const result = await agent.loop({
+  prompt: 'Begin your pomodoro session. Start by checking for .pomodoro/backlog.md — if it exists, read it and start working. If not, bootstrap one from the project.',
+});
 const totalDuration = Date.now() - startTime;
 
-// Print summary
+// ---------------------------------------------------------------------------
+// Summary
+// ---------------------------------------------------------------------------
+
 console.log('\n╭───────────────────────────────────────────────────────────────╮');
 console.log('│  RESULT                                                       │');
 console.log('╰───────────────────────────────────────────────────────────────╯');
-console.log(`\nCompletion: ${result.completionReason}`);
+console.log(`\nSession:    ${sessionId}`);
+console.log(`Completion: ${result.completionReason}`);
 console.log(`Iterations: ${result.iterations}`);
-console.log(`Duration: ${Math.round(totalDuration / 1000)}s (${(totalDuration / 60000).toFixed(2)} min)`);
-console.log(`Tokens: in=${result.totalUsage.inputTokens ?? 0}, out=${result.totalUsage.outputTokens ?? 0}`);
-console.log(`\nSummary: ${result.reason || 'N/A'}`);
+console.log(`Duration:   ${Math.round(totalDuration / 1000)}s (${(totalDuration / 60000).toFixed(1)} min)`);
+console.log(`Tokens:     in=${result.totalUsage.inputTokens ?? 0}, out=${result.totalUsage.outputTokens ?? 0}`);
+console.log(`\nReason: ${result.reason || 'N/A'}`);
+
+// Check if session report was written
+try {
+  await fs.access(sessionReportPath);
+  console.log(`\nSession report: ${sessionReportPath}`);
+} catch {
+  console.log('\nNo session report written (agent may have run out of time).');
+  // Write a minimal one ourselves
+  const minimalReport = `# Session ${sessionId}\n\nModel: ${modelName}\nDuration: ${Math.round(totalDuration / 1000)}s\nIterations: ${result.iterations}\nCompletion: ${result.completionReason}\n\n_Agent did not write a session report. Check git diff for changes._\n`;
+  await fs.mkdir(path.dirname(sessionReportPath), { recursive: true });
+  await fs.writeFile(sessionReportPath, minimalReport, 'utf-8');
+  console.log(`Wrote minimal report: ${sessionReportPath}`);
+}
+
 console.log(`\nFinal output:\n${result.text.slice(0, 500)}${result.text.length > 500 ? '...' : ''}`);
