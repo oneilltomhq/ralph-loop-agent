@@ -6,9 +6,11 @@
     "start": "tsx index.ts"
   },
   "dependencies": {
-    "ai": "^4.0.0",
+    "@ai-sdk/google": "^2.0.0",
+    "@ai-sdk/openai": "2.0.95",
+    "ai": "^6.0.0",
     "ralph-loop-agent": "workspace:*",
-    "zod": "^3.25.0"
+    "zod": "^4.0.0"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

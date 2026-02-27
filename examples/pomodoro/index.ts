@@ -5,14 +5,17 @@
  * Proves: one agent + durationIs() + coding tools = useful work in 25min
  *
  * Usage:
- *   npx tsx index.ts "Your task here"
- *   npx tsx index.ts ./task.md
+ *   npx tsx index.ts "Your task here" [working-dir]
+ *   npx tsx index.ts ./task.md [working-dir]
  *
  * Environment:
- *   OPENAI_API_KEY or ANTHROPIC_API_KEY - Your API key
+ *   GEMINI_API_KEY - Google Gemini API key (recommended - fast & cheap)
+ *   OPENAI_API_KEY - Or use OpenAI
+ *   ANTHROPIC_API_KEY - Or use Anthropic
  */
 
 import { RalphLoopAgent, durationIs, costIs, iterationCountIs } from 'ralph-loop-agent';
+import { google } from '@ai-sdk/google';
 import { tool } from 'ai';
 import { z } from 'zod';
 import * as fs from 'fs/promises';
@@ -23,14 +26,21 @@ const execAsync = promisify(childProcess.exec);
 
 // Parse CLI args
 const taskArg = process.argv[2];
+const workDir = process.argv[3] ? process.argv[3].replace('~', process.env.HOME || '') : process.cwd();
+
 if (!taskArg) {
-  console.error('Usage: npx tsx index.ts <task or task-file>');
+  console.error('Usage: npx tsx index.ts <task or task-file> [working-directory]');
   console.error('');
   console.error('Examples:');
   console.error('  npx tsx index.ts "Add a hello world function to hello.ts"');
   console.error('  npx tsx index.ts ./task.md');
+  console.error('  npx tsx index.ts "Read TODO.md and complete tasks" /path/to/repo');
   process.exit(1);
 }
+
+// Change to working directory
+process.chdir(workDir);
+console.log(`Working directory: ${workDir}`);
 
 // Read task from file or use as-is
 let task: string;
@@ -124,43 +134,93 @@ const tools = {
 
 // Configure agent with pomodoro-style stop policy
 const POMODORO_MS = 25 * 60 * 1000; // 25 minutes
-const MAX_COST = 2.00; // $2 budget
-const MAX_ITERATIONS = 6;
+const MAX_COST = 50.00; // $50 budget (generous for testing)
+const MAX_ITERATIONS = 50; // Allow many iterations to hit duration limit
+
+// Model selection - prefer minimax via OpenRouter (cheapest)
+let model: any;
+if (process.env.OPENROUTER_API_KEY) {
+  const { createOpenAI } = await import('@ai-sdk/openai');
+  const openrouter = createOpenAI({
+    apiKey: process.env.OPENROUTER_API_KEY,
+    baseURL: 'https://openrouter.ai/api/v1',
+    compatibility: 'strict', // Force chat completions format
+  });
+  model = openrouter('minimax/minimax-m2.5');
+  console.log('Model: minimax-m2.5 (via OpenRouter)');
+} else if (process.env.GOOGLE_GENERATIVE_AI_API_KEY || process.env.GEMINI_API_KEY) {
+  model = google('gemini-2.5-pro');
+  console.log('Model: gemini-2.5-pro (via Google AI)');
+} else if (process.env.OPENAI_API_KEY) {
+  const { createOpenAI } = await import('@ai-sdk/openai');
+  const openai = createOpenAI({ apiKey: process.env.OPENAI_API_KEY });
+  model = openai('gpt-4o-mini');
+  console.log('Model: gpt-4o-mini (via OpenAI)');
+} else {
+  console.error('Error: Set OPENROUTER_API_KEY, GOOGLE_GENERATIVE_AI_API_KEY, or OPENAI_API_KEY');
+  process.exit(1);
+}
 
 const agent = new RalphLoopAgent({
-  model: process.env.ANTHROPIC_API_KEY 
-    ? 'anthropic/claude-sonnet-4' 
-    : 'openai/gpt-4o',
-  instructions: `You are a coding agent with a time budget. Work efficiently.
+  model,
+  instructions: `You are a coding agent with a 25-minute time budget. Your goal is to maximize useful work done in that time.
 
-Guidelines:
-1. Read files before modifying them
-2. Make incremental changes and verify they work
-3. Run tests/commands to verify your changes
-4. Use markComplete when the task is done and verified
+## CRITICAL: Run For Full 25 Minutes
 
-Be focused - you have limited time and budget.`,
+- You have a HARD STOP at 25 minutes — work until the duration limit is hit
+- Do NOT call markComplete until the very end when time is running out
+- Complete as many tasks as possible in sequence
+- When you finish a task, immediately pick the next one and keep working
+
+## Workflow (REPEAT until time runs out)
+
+1. **Read the backlog** — Look for TODO.md, ROADMAP.md
+2. **Pick ONE task** — Lowest-numbered incomplete item
+3. **Complete it** — Make changes, verify they work
+4. **Update roadmap** — Mark item complete, add findings
+5. **PICK NEXT TASK IMMEDIATELY** — Don't stop, keep going!
+6. **If roadmap is done** — Check README.md, LAB.md for new work
+7. **Create new items** — Add to ROADMAP.md and complete them
+8. **Only call markComplete** — When you sense time is almost up (many iterations done)
+
+## What To Do If You Run Out Of Roadmap
+
+- Read README.md and LAB.md for project direction
+- Look at the codebase for obvious improvements
+- Create new ROADMAP items for features, tests, docs, refactoring
+- Keep working until the duration limit forces you to stop
+
+## DO NOT
+
+- Do NOT call markComplete after each task — save it for the end
+- Do NOT stop early because you completed a few tasks
+- Do NOT wait for user input — work autonomously
+
+Be productive. Keep working. The experiment depends on you running for ~25 minutes.`,
   tools,
   stopWhen: [
     durationIs(POMODORO_MS),
-    costIs(MAX_COST),
+    costIs(MAX_COST, { inputCostPerMillionTokens: 0.2, outputCostPerMillionTokens: 0.2 }), // minimax pricing
     iterationCountIs(MAX_ITERATIONS),
   ],
   verifyCompletion: async ({ result }) => {
-    // Check if markComplete was called
+    // Don't exit just because markComplete was called - let the stop conditions handle that
+    // This allows the agent to keep working through multiple tasks
+    let hasMarkedComplete = false;
     for (const step of result.steps) {
       for (const toolResult of step.toolResults) {
         if (toolResult.toolName === 'markComplete') {
-          const output = toolResult.output as any;
-          if (output?.complete) {
-            return { complete: true, reason: output.summary };
-          }
+          hasMarkedComplete = true;
+          // Don't return complete: true here - let duration/cost/iteration limits control when to stop
         }
       }
     }
+    if (hasMarkedComplete) {
+      console.log('  → Task complete, continuing to next task...');
+    }
     return { 
       complete: false, 
-      reason: 'Continue working. Use markComplete when done.' 
+      reason: 'Continue working. More tasks available.' 
     };
   },
 });
